@@ -4,13 +4,31 @@ import shutil
 import tempfile
 import uuid
 import logging
-from typing import List
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+import datetime
+from typing import List, Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
+import av
+
+# Fix PyAV compatibility where 'metadata_errors' parameter was removed in av >= 14
+_orig_av_open = av.open
+def _compat_av_open(*args, **kwargs):
+    kwargs.pop("metadata_errors", None)
+    return _orig_av_open(*args, **kwargs)
+av.open = _compat_av_open
+
 from faster_whisper import WhisperModel
 from faster_whisper.audio import decode_audio
+
+import db
+import worker
+import exporter
+
+# Initialize SQLite database schema and storage directories
+db.init_db()
 
 # Ensure stdout and stderr handle Thai / UTF-8 characters without 'charmap' errors on Windows
 if sys.platform == "win32":
@@ -54,7 +72,7 @@ compute_type = "float16" if is_cuda else "int8"
 # Determine CPU threads (i5-11500B has 6 physical cores / 12 logical threads)
 cpu_threads = max(4, min(os.cpu_count() or 6, 8))
 
-model: WhisperModel = None
+model: Optional[WhisperModel] = None
 
 def get_model():
     global model
@@ -72,7 +90,8 @@ def get_model():
 
 @app.on_event("startup")
 async def startup_event():
-    # Model will be loaded or ready on startup
+    db.init_db()
+    # Model will be loaded or ready on startup in background thread
     import threading
     threading.Thread(target=get_model, daemon=True).start()
 
@@ -92,12 +111,17 @@ class TranscriptionResponse(BaseModel):
 def health_check():
     return {"status": "ok", "device": device, "compute_type": compute_type}
 
-@app.post("/api/transcribe", response_model=TranscriptionResponse)
-async def transcribe_audio(
+# ==========================================
+# Resilient Asynchronous Job Suite
+# ==========================================
+
+@app.post("/api/jobs")
+async def create_job(
     file: UploadFile = File(...),
-    audio_type: str = Form("general"),  # "general" (speech/meeting) or "music" (songs with loud background music)
+    audio_type: str = Form("general"),
     vad_filter: bool = Form(True),
-    chunk_duration: int = Form(0),  # 0 = continuous full-file, 60 = 60-second chunks
+    beam_size: int = Form(1),
+    chunk_duration: int = Form(0),
 ):
     filename = file.filename or "audio"
     _, ext = os.path.splitext(filename.lower())
@@ -107,14 +131,209 @@ async def transcribe_audio(
             detail=f"Unsupported file extension '{ext}'. Supported formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
-    # Save to a temporary file with safe ASCII name to prevent C-library encoding issues
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    job_dir = os.path.join(db.DEFAULT_STORAGE_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, f"audio{ext}")
+
+    written_size = 0
+    chunk_size = 1024 * 1024  # 1MB chunks
+    with open(audio_path, "wb") as buffer:
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            written_size += len(chunk)
+            if written_size > MAX_FILE_SIZE:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+                limit_gb = MAX_FILE_SIZE / (1024 * 1024 * 1024)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"ไฟล์มีขนาดใหญ่เกินกำหนด (จำกัดไม่เกิน {limit_gb:.0f} GB)"
+                )
+            buffer.write(chunk)
+
+    created = db.create_job(
+        job_id=job_id,
+        filename=filename,
+        filesize=written_size,
+        audio_type=audio_type,
+        vad_filter=vad_filter,
+        beam_size=beam_size,
+        chunk_duration=chunk_duration,
+    )
+
+    worker.start_transcription_job(
+        job_id=job_id,
+        audio_file_path=audio_path,
+        audio_type=audio_type,
+        vad_filter=vad_filter,
+        beam_size=beam_size,
+        chunk_duration=chunk_duration,
+    )
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 50):
+    return db.list_jobs(limit=limit)
+
+
+@app.get("/api/jobs/{job_id}/progress")
+def get_job_progress(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    segments = db.get_segments(job_id)
+    
+    elapsed = 0.0
+    created_at_str = job.get("created_at")
+    if created_at_str:
+        try:
+            dt = datetime.datetime.fromisoformat(created_at_str)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            elapsed = max(0.0, (now - dt).total_seconds())
+        except Exception:
+            pass
+
+    progress = float(job.get("progress", 0.0))
+    eta = 0.0
+    if 0.0 < progress < 100.0 and elapsed > 0.0:
+        eta = max(0.0, (elapsed / progress) * (100.0 - progress))
+
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "progress": progress,
+        "current_time": float(job.get("current_time", 0.0)),
+        "duration": float(job.get("duration", 0.0)),
+        "elapsed_seconds": round(elapsed, 1),
+        "estimated_remaining_seconds": round(eta, 1),
+        "latest_segments": segments[-10:] if len(segments) > 10 else segments,
+        "segment_count": len(segments),
+        "error_message": job.get("error_message"),
+    }
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job_detail(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = db.get_final_result(job_id)
+    if not result:
+        segments = db.get_segments(job_id)
+        if segments:
+            full_text = " ".join([s["text"] for s in segments if s.get("text")])
+            result = {"text": full_text, "segments": segments}
+
+    return {
+        "job": job,
+        "result": result,
+    }
+
+
+@app.get("/api/jobs/{job_id}/audio")
+def get_job_audio(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_dir = os.path.join(db.DEFAULT_STORAGE_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job storage not found")
+
+    # Locate audio file
+    for f in os.listdir(job_dir):
+        if f.startswith("audio."):
+            audio_path = os.path.join(job_dir, f)
+            return FileResponse(path=audio_path, filename=job["filename"])
+
+    raise HTTPException(status_code=404, detail="Audio file not found for this job")
+
+
+@app.get("/api/jobs/{job_id}/export")
+def export_job_result(
+    job_id: str,
+    format: str = Query("txt", pattern="^(txt|srt|vtt|json)$"),
+    timestamps: bool = Query(False),
+):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = db.get_final_result(job_id)
+    if not result:
+        segments = db.get_segments(job_id)
+        if segments:
+            full_text = " ".join([s["text"] for s in segments if s.get("text")])
+            result = {"text": full_text, "segments": segments}
+        else:
+            raise HTTPException(status_code=400, detail="Job has no transcription results yet")
+
+    text = result.get("text", "")
+    segments = result.get("segments", [])
+
+    base_name, _ = os.path.splitext(job["filename"])
+    safe_base = "".join(c for c in base_name if c.isalnum() or c in ("-", "_", " ")).strip() or job_id
+
+    if format == "srt":
+        content = exporter.export_srt(segments)
+        media_type = "text/plain; charset=utf-8"
+        filename = f"{safe_base}.srt"
+    elif format == "vtt":
+        content = exporter.export_vtt(segments)
+        media_type = "text/vtt; charset=utf-8"
+        filename = f"{safe_base}.vtt"
+    elif format == "json":
+        content = exporter.export_json(job, text, segments)
+        media_type = "application/json; charset=utf-8"
+        filename = f"{safe_base}.json"
+    else:  # txt
+        content = exporter.export_txt(text, segments, include_timestamps=timestamps)
+        media_type = "text/plain; charset=utf-8"
+        suffix = "_timestamped" if timestamps else ""
+        filename = f"{safe_base}{suffix}.txt"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ==========================================
+# Legacy Synchronous Transcription Endpoint
+# ==========================================
+
+@app.post("/api/transcribe", response_model=TranscriptionResponse)
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    audio_type: str = Form("general"),
+    vad_filter: bool = Form(True),
+    chunk_duration: int = Form(0),
+):
+    filename = file.filename or "audio"
+    _, ext = os.path.splitext(filename.lower())
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file extension '{ext}'. Supported formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
     temp_dir = tempfile.mkdtemp()
     safe_name = f"audio_{uuid.uuid4().hex[:12]}{ext}"
     temp_file_path = os.path.join(temp_dir, safe_name)
 
     try:
         written_size = 0
-        chunk_size = 1024 * 1024  # 1MB chunks
+        chunk_size = 1024 * 1024
         with open(temp_file_path, "wb") as buffer:
             while True:
                 chunk = await file.read(chunk_size)
@@ -131,9 +350,6 @@ async def transcribe_audio(
 
         whisper_instance = get_model()
 
-        # Audio type tuning:
-        # Songs have background instrumentals that VAD often misclassifies as non-speech.
-        # We disable strict VAD and set no_speech_threshold to None so lyrics are never skipped.
         is_music = audio_type.lower() == "music"
         use_vad = False if is_music else vad_filter
 
@@ -151,32 +367,23 @@ async def transcribe_audio(
         segment_list = []
         collected_text = []
 
-        print(f"Transcribing '{filename}' (audio_type={audio_type}, use_vad={use_vad}, chunk_duration={chunk_duration}s)...")
-
         if chunk_duration > 0:
-            # Decode full audio into 16kHz float32 numpy array
             waveform = decode_audio(temp_file_path, sampling_rate=16000)
             total_samples = len(waveform)
             total_duration = total_samples / 16000.0
-            print(f"Loaded audio: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
 
             if total_duration > chunk_duration:
                 num_chunks = int(np.ceil(total_duration / chunk_duration))
-                print(f"Splitting into {num_chunks} chunks of {chunk_duration}s...")
-
                 for idx in range(num_chunks):
                     start_sec = idx * chunk_duration
                     end_sec = min((idx + 1) * chunk_duration, total_duration)
                     start_sample = int(start_sec * 16000)
                     end_sample = min(int(end_sec * 16000), total_samples)
 
-                    # Skip tiny residual fragments (< 0.3s)
                     if (end_sample - start_sample) < 16000 * 0.3:
                         continue
 
                     chunk_audio = waveform[start_sample:end_sample]
-                    print(f"  -> Processing Chunk {idx + 1}/{num_chunks} [{start_sec:.1f}s - {end_sec:.1f}s]...")
-
                     chunk_segments, _ = whisper_instance.transcribe(
                         chunk_audio,
                         language="th",
@@ -203,7 +410,6 @@ async def transcribe_audio(
                         if text_strip:
                             collected_text.append(text_strip)
             else:
-                # Audio is shorter than chunk_duration, transcribe all directly
                 segments_generator, info = whisper_instance.transcribe(
                     waveform,
                     language="th",
@@ -227,7 +433,6 @@ async def transcribe_audio(
                     if text_strip:
                         collected_text.append(text_strip)
         else:
-            # Continuous full-file transcription
             segments_generator, info = whisper_instance.transcribe(
                 temp_file_path,
                 language="th",
@@ -253,7 +458,6 @@ async def transcribe_audio(
                     collected_text.append(text_strip)
 
         full_text = " ".join(collected_text)
-
         return {
             "text": full_text,
             "segments": segment_list
@@ -262,7 +466,6 @@ async def transcribe_audio(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
     finally:
-        # Proper temporary file and directory cleanup
         try:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
