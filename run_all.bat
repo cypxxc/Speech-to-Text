@@ -21,7 +21,7 @@ echo [1/2] Starting Python FastAPI Backend on http://localhost:8000 ...
 start "Thai STT - Backend" cmd /k "cd /d \"%~dp0backend\" && call venv\Scripts\activate && set PYTHONUTF8=1 && set PYTHONIOENCODING=utf-8 && python -m uvicorn main:app --port 8000 --reload"
 
 echo [2/2] Starting Next.js Frontend on http://localhost:3000 ...
-start "Thai STT - Frontend" cmd /k "cd /d \"%~dp0\" && npm run dev"
+start "Thai STT - Frontend" cmd /k "cd /d \"%~dp0\" && npm run dev:frontend"
 
 echo ========================================================
 echo Both services are starting in separate terminal windows.
