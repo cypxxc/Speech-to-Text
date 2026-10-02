@@ -17,6 +17,25 @@ from db import update_job_status, append_segment, save_final_result, get_segment
 
 logger = logging.getLogger("stt_worker")
 
+_cancelled_jobs = set()
+
+
+def cancel_job(job_id: str) -> None:
+    _cancelled_jobs.add(job_id)
+
+
+def is_job_cancelled(job_id: str) -> bool:
+    return job_id in _cancelled_jobs
+
+
+def _cleanup_cancelled_job(job_id: str, storage_dir: Optional[str] = None, db_path: Optional[str] = None):
+    _cancelled_jobs.discard(job_id)
+    segments = get_segments(job_id, storage_dir=storage_dir)
+    if segments:
+        full_text = " ".join([s["text"] for s in segments if s.get("text")])
+        save_final_result(job_id, full_text, segments, storage_dir=storage_dir)
+    update_job_status(job_id, "failed", error_message="ผู้ใช้ยกเลิกการถอดเสียง (Cancelled by user)", db_path=db_path)
+
 
 def get_default_model():
     from main import get_model
@@ -83,6 +102,11 @@ def process_job_sync(
             if total_duration > chunk_duration:
                 num_chunks = int(np.ceil(total_duration / chunk_duration))
                 for idx in range(num_chunks):
+                    if is_job_cancelled(job_id):
+                        logger.info(f"Job {job_id} cancelled during chunk processing.")
+                        _cleanup_cancelled_job(job_id, storage_dir=storage_dir, db_path=db_path)
+                        return
+
                     start_sec = idx * chunk_duration
                     end_sec = min((idx + 1) * chunk_duration, total_duration)
                     start_sample = int(start_sec * 16000)
@@ -140,6 +164,11 @@ def process_job_sync(
                     initial_prompt=prompt,
                 )
                 for seg in segments_generator:
+                    if is_job_cancelled(job_id):
+                        logger.info(f"Job {job_id} cancelled during waveform processing.")
+                        _cleanup_cancelled_job(job_id, storage_dir=storage_dir, db_path=db_path)
+                        return
+
                     text_strip = seg.text.strip()
                     append_segment(
                         job_id,
@@ -176,6 +205,11 @@ def process_job_sync(
                 update_job_status(job_id, "processing", duration=total_duration, db_path=db_path)
 
             for seg in segments_generator:
+                if is_job_cancelled(job_id):
+                    logger.info(f"Job {job_id} cancelled during continuous stream processing.")
+                    _cleanup_cancelled_job(job_id, storage_dir=storage_dir, db_path=db_path)
+                    return
+
                 text_strip = seg.text.strip()
                 append_segment(
                     job_id,

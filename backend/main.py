@@ -91,6 +91,10 @@ def get_model():
 @app.on_event("startup")
 async def startup_event():
     db.init_db()
+    # Recover any jobs that were interrupted if server was killed or crashed
+    interrupted = db.recover_interrupted_jobs()
+    if interrupted:
+        logging.info(f"Disaster Recovery: Found and recovered {len(interrupted)} interrupted job(s) from previous run: {interrupted}")
     # Model will be loaded or ready on startup in background thread
     import threading
     threading.Thread(target=get_model, daemon=True).start()
@@ -237,6 +241,27 @@ def get_job_detail(job_id: str):
         "job": job,
         "result": result,
     }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] in ("completed", "failed"):
+        return {"job_id": job_id, "status": job["status"], "message": "Job already finished"}
+
+    worker.cancel_job(job_id)
+    db.update_job_status(job_id, "failed", error_message="ผู้ใช้ยกเลิกการถอดเสียง (Cancelled by user)")
+
+    # Finalize any segments already transcribed so far
+    segments = db.get_segments(job_id)
+    if segments and not db.get_final_result(job_id):
+        full_text = " ".join([s["text"] for s in segments if s.get("text")])
+        db.save_final_result(job_id, full_text, segments)
+
+    return {"job_id": job_id, "status": "failed", "message": "Job cancelled successfully"}
 
 
 @app.get("/api/jobs/{job_id}/audio")

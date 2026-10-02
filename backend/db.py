@@ -225,3 +225,40 @@ def get_final_result(job_id: str, storage_dir: Optional[str] = None) -> Optional
         return None
     with open(result_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def recover_interrupted_jobs(db_path: Optional[str] = None, storage_dir: Optional[str] = None) -> List[str]:
+    """
+    Recovers any jobs that were stuck in 'processing' or 'queued' when the server stopped/crashed.
+    Marks them as 'failed' with an explanation, and if segments exist, finalizes partial results.
+    """
+    actual_db, actual_storage = _resolve_paths(db_path, storage_dir)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    recovered_ids = []
+
+    with get_db_connection(actual_db) as conn:
+        cursor = conn.execute("SELECT id FROM jobs WHERE status IN ('processing', 'queued')")
+        rows = cursor.fetchall()
+        recovered_ids = [r["id"] for r in rows]
+
+        if recovered_ids:
+            conn.execute(
+                """
+                UPDATE jobs 
+                SET status = 'failed', 
+                    error_message = 'ระบบหยุดทำงานก่อนการประมวลผลเสร็จสิ้น (Server Interrupted / Restarted)',
+                    updated_at = ?
+                WHERE status IN ('processing', 'queued')
+                """,
+                (now,)
+            )
+
+    # Preserve any partially transcribed segments
+    for jid in recovered_ids:
+        segments = get_segments(jid, storage_dir=actual_storage)
+        if segments and not get_final_result(jid, storage_dir=actual_storage):
+            full_text = " ".join([s["text"] for s in segments if s.get("text")])
+            save_final_result(jid, full_text, segments, storage_dir=actual_storage)
+
+    return recovered_ids
+

@@ -69,3 +69,23 @@ def test_job_progress_and_export(tmp_path, monkeypatch):
     resp_json = client.get(f"/api/jobs/{job_id}/export?format=json")
     assert resp_json.status_code == 200
     assert job_id in resp_json.text
+
+
+def test_cancel_job_endpoint():
+    import uuid
+    job_id = f"test-cancel-{uuid.uuid4().hex[:8]}"
+    create_job(job_id, "long_lecture.mp3", 5000, "general", True, 1, 0)
+    update_job_status(job_id, "processing", progress=20.0, current_time=20.0, duration=100.0)
+    append_segment(job_id, {"start": 0.0, "end": 5.0, "text": "บทนำก่อนกดยกเลิก"})
+
+    resp = client.post(f"/api/jobs/{job_id}/cancel")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "failed"
+
+    # Status in db should be failed
+    progress_resp = client.get(f"/api/jobs/{job_id}/progress")
+    assert progress_resp.status_code == 200
+    assert progress_resp.json()["status"] == "failed"
+    assert "ยกเลิก" in progress_resp.json()["error_message"]
+

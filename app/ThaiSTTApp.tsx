@@ -268,6 +268,19 @@ export default function ThaiSTTApp() {
     }
   };
 
+  const handleCancelJob = async () => {
+    if (!activeJobId) return;
+    try {
+      await fetch(`${BACKEND_URL}/api/jobs/${activeJobId}/cancel`, { method: "POST" });
+    } catch (err) {
+      console.warn("Cancel request error:", err);
+    }
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    localStorage.removeItem(STORAGE_KEY);
+    setJobStatus("failed");
+    setError("ยกเลิกการถอดเสียงเรียบร้อยแล้ว");
+  };
+
   const handleReset = () => {
     if (pollTimerRef.current) clearInterval(pollTimerRef.current);
     localStorage.removeItem(STORAGE_KEY);
@@ -398,10 +411,17 @@ export default function ThaiSTTApp() {
                   {jobStatus === "queued" ? "กำลังรอคิวประมวลผล..." : "กำลังถอดเสียงในเบื้องหลัง (Background Worker)"}
                 </span>
               </div>
-              <div className="flex items-center gap-4 text-xs font-mono text-slate-500 dark:text-zinc-400">
+              <div className="flex items-center gap-3 text-xs font-mono text-slate-500 dark:text-zinc-400">
                 <span>⏱️ ใช้เวลา: {formatTimeClock(elapsedSeconds)}</span>
                 {remainingSeconds > 0 && <span>⏳ คาดว่าจะเสร็จ: ~{formatTimeClock(remainingSeconds)}</span>}
                 <span className="font-bold text-emerald-600 dark:text-emerald-400">{progress.toFixed(0)}%</span>
+                <button
+                  onClick={handleCancelJob}
+                  className="px-2 py-0.5 text-xs font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-md hover:bg-red-100 dark:hover:bg-red-900/60 cursor-pointer transition-colors"
+                  title="ยกเลิกการถอดเสียงทันที"
+                >
+                  🛑 ยกเลิก
+                </button>
               </div>
             </div>
 
@@ -694,19 +714,27 @@ export default function ThaiSTTApp() {
           </div>
         )}
 
-        {/* Results Section (When completed) */}
-        {jobStatus === "completed" && (
+        {/* Results Section (When completed or when failed with partial segments) */}
+        {(jobStatus === "completed" || (jobStatus === "failed" && segments.length > 0)) && (
           <div className="bg-white dark:bg-zinc-900 shadow-sm border border-slate-200 dark:border-zinc-800 rounded-2xl p-6 sm:p-8 space-y-6">
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-zinc-800">
               <div>
                 <div className="flex items-center gap-2">
-                  <span className="p-1 rounded-md bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400">
+                  <span
+                    className={`p-1 rounded-md ${
+                      jobStatus === "completed"
+                        ? "bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400"
+                        : "bg-amber-100 dark:bg-amber-950 text-amber-600 dark:text-amber-400"
+                    }`}
+                  >
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                     </svg>
                   </span>
                   <h2 className="text-xl font-bold text-slate-800 dark:text-zinc-100">
-                    ผลลัพธ์การถอดเสียง (เสร็จสมบูรณ์)
+                    {jobStatus === "completed"
+                      ? "ผลลัพธ์การถอดเสียง (เสร็จสมบูรณ์)"
+                      : "ผลลัพธ์การถอดเสียงบางส่วน (บันทึกไว้ก่อนหยุดทำงาน)"}
                   </h2>
                 </div>
                 <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1">

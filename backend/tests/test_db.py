@@ -59,3 +59,27 @@ def test_db_crud(temp_env):
     jobs_list = list_jobs(limit=10, db_path=db_file)
     assert len(jobs_list) == 1
     assert jobs_list[0]["id"] == "job-123"
+
+
+def test_recover_interrupted_jobs(temp_env):
+    from db import recover_interrupted_jobs
+    db_file, storage_dir = temp_env
+    init_db(db_file, storage_dir)
+
+    # Simulate a job that was in 'processing' when server died
+    create_job("job-stuck", "podcast.mp3", 2048, "general", True, 1, 0, db_path=db_file, storage_dir=storage_dir)
+    update_job_status("job-stuck", "processing", progress=40.0, current_time=48.0, duration=120.0, db_path=db_file)
+    append_segment("job-stuck", {"start": 0.0, "end": 5.0, "text": "ท่อนแรกก่อนไฟดับ"}, storage_dir=storage_dir)
+
+    recovered = recover_interrupted_jobs(db_path=db_file, storage_dir=storage_dir)
+    assert "job-stuck" in recovered
+
+    stuck_job = get_job("job-stuck", db_path=db_file, storage_dir=storage_dir)
+    assert stuck_job["status"] == "failed"
+    assert "ระบบหยุดทำงาน" in stuck_job["error_message"]
+
+    # Partial result should be saved from segments
+    partial_res = get_final_result("job-stuck", storage_dir=storage_dir)
+    assert partial_res is not None
+    assert partial_res["text"] == "ท่อนแรกก่อนไฟดับ"
+
