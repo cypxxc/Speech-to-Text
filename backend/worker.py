@@ -14,6 +14,7 @@ def _compat_av_open(*args, **kwargs):
 av.open = _compat_av_open
 
 from db import update_job_status, append_segment, save_final_result, get_segments
+from corrector import correct_text, correct_segments
 
 logger = logging.getLogger("stt_worker")
 
@@ -31,15 +32,16 @@ def is_job_cancelled(job_id: str) -> bool:
 def _cleanup_cancelled_job(job_id: str, storage_dir: Optional[str] = None, db_path: Optional[str] = None):
     _cancelled_jobs.discard(job_id)
     segments = get_segments(job_id, storage_dir=storage_dir)
+    segments = correct_segments(segments)
     if segments:
         full_text = " ".join([s["text"] for s in segments if s.get("text")])
         save_final_result(job_id, full_text, segments, storage_dir=storage_dir)
     update_job_status(job_id, "failed", error_message="ผู้ใช้ยกเลิกการถอดเสียง (Cancelled by user)", db_path=db_path)
 
 
-def get_default_model():
+def get_default_model(model_name: str = "large-v3-turbo"):
     from main import get_model
-    return get_model()
+    return get_model(model_name)
 
 
 def probe_audio_duration(file_path: str) -> float:
@@ -59,16 +61,18 @@ def process_job_sync(
     vad_filter: bool = True,
     beam_size: int = 1,
     chunk_duration: int = 0,
+    model_name: str = "large-v3-turbo",
+    initial_prompt: Optional[str] = None,
     db_path: Optional[str] = None,
     storage_dir: Optional[str] = None,
     model_instance: Optional[Any] = None,
     mock_duration: Optional[float] = None,
 ) -> None:
     try:
-        logger.info(f"Starting job {job_id} on {audio_file_path} (beam_size={beam_size}, chunk_duration={chunk_duration})")
+        logger.info(f"Starting job {job_id} on {audio_file_path} (model={model_name}, beam_size={beam_size}, chunk_duration={chunk_duration})")
         update_job_status(job_id, "processing", progress=0.0, current_time=0.0, db_path=db_path)
 
-        whisper_instance = model_instance if model_instance is not None else get_default_model()
+        whisper_instance = model_instance if model_instance is not None else get_default_model(model_name)
 
         # Audio type tuning
         is_music = audio_type.lower() == "music"
@@ -77,13 +81,21 @@ def process_job_sync(
         vad_params = None
         if use_vad:
             vad_params = dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=400,
+                min_silence_duration_ms=800,
+                speech_pad_ms=300,
             )
 
         no_speech_thresh = None if is_music else 0.6
         comp_ratio = 2.8 if is_music else 2.4
-        prompt = "เนื้อเพลงภาษาไทย คำร้องทำนอง บทเพลง" if is_music else None
+
+        if is_music:
+            prompt = "เนื้อเพลงภาษาไทย คำร้องทำนอง บทเพลง"
+        else:
+            base_prompt = "ภาษาไทย การประชุม สัมมนา บรรยาย การพูดคุย นโยบาย สารสนเทศ บริการคลาวด์"
+            if initial_prompt and initial_prompt.strip():
+                prompt = f"{base_prompt} {initial_prompt.strip()}"
+            else:
+                prompt = base_prompt
 
         # Determine duration
         total_duration = mock_duration if mock_duration is not None else probe_audio_duration(audio_file_path)
@@ -131,7 +143,7 @@ def process_job_sync(
                     )
 
                     for seg in chunk_segments:
-                        text_strip = seg.text.strip()
+                        text_strip = correct_text(seg.text.strip())
                         abs_start = round(start_sec + seg.start, 2)
                         abs_end = round(start_sec + seg.end, 2)
                         append_segment(
@@ -169,7 +181,7 @@ def process_job_sync(
                         _cleanup_cancelled_job(job_id, storage_dir=storage_dir, db_path=db_path)
                         return
 
-                    text_strip = seg.text.strip()
+                    text_strip = correct_text(seg.text.strip())
                     append_segment(
                         job_id,
                         {"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text_strip},
@@ -210,7 +222,7 @@ def process_job_sync(
                     _cleanup_cancelled_job(job_id, storage_dir=storage_dir, db_path=db_path)
                     return
 
-                text_strip = seg.text.strip()
+                text_strip = correct_text(seg.text.strip())
                 append_segment(
                     job_id,
                     {"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text_strip},
@@ -228,6 +240,7 @@ def process_job_sync(
 
         # Finalize
         segments = get_segments(job_id, storage_dir=storage_dir)
+        segments = correct_segments(segments)
         full_text = " ".join([s["text"] for s in segments if s.get("text")])
         save_final_result(job_id, full_text, segments, storage_dir=storage_dir)
         update_job_status(
@@ -252,6 +265,8 @@ def start_transcription_job(
     vad_filter: bool = True,
     beam_size: int = 1,
     chunk_duration: int = 0,
+    model_name: str = "large-v3-turbo",
+    initial_prompt: Optional[str] = None,
     db_path: Optional[str] = None,
     storage_dir: Optional[str] = None,
 ) -> threading.Thread:
@@ -264,6 +279,8 @@ def start_transcription_job(
             "vad_filter": vad_filter,
             "beam_size": beam_size,
             "chunk_duration": chunk_duration,
+            "model_name": model_name,
+            "initial_prompt": initial_prompt,
             "db_path": db_path,
             "storage_dir": storage_dir,
         },

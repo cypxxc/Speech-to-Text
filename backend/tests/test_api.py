@@ -89,3 +89,24 @@ def test_cancel_job_endpoint():
     assert progress_resp.json()["status"] == "failed"
     assert "ยกเลิก" in progress_resp.json()["error_message"]
 
+
+def test_summarize_job_endpoint():
+    import uuid
+    job_id = f"test-sum-{uuid.uuid4().hex[:8]}"
+    create_job(job_id, "meeting_cloud.mp3", 3000, "general", True, 1, 0)
+    save_final_result(job_id, "สวัสดีครับ ขอเปิดการประชุมเรื่องคลาวด์ รบกวนส่งรายงานด่วน", [{"start": 0.0, "end": 5.0, "text": "สวัสดีครับ ขอเปิดการประชุมเรื่องคลาวด์ รบกวนส่งรายงานด่วน"}])
+    update_job_status(job_id, "completed", progress=100.0, current_time=60.0, duration=60.0)
+
+    resp = client.post(f"/api/jobs/{job_id}/summarize")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["filename"] == "meeting_cloud.mp3"
+    assert "overview" in data
+    assert len(data["action_items"]) > 0
+
+    # Test GET summary
+    resp_get = client.get(f"/api/jobs/{job_id}/summary")
+    assert resp_get.status_code == 200
+    assert resp_get.json()["filename"] == "meeting_cloud.mp3"
+
+

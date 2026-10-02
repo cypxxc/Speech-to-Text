@@ -69,11 +69,28 @@ export default function ThaiSTTApp() {
   const [currentTime, setCurrentTime] = useState(0);
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number | null>(null);
 
+  // Model & Vocabulary Tuning
+  const [modelName, setModelName] = useState<"small" | "large-v3-turbo" | "medium">("small");
+  const [initialPrompt, setInitialPrompt] = useState("");
+
   // UI Modals & Dropdowns
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [historyJobs, setHistoryJobs] = useState<JobMeta[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Summary State & Modal
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [summaryData, setSummaryData] = useState<{
+    filename: string;
+    duration_minutes: number;
+    overview: string;
+    key_phrases: string[];
+    key_points: string[];
+    action_items: string[];
+  } | null>(null);
+  const [loadingSummary, setLoadingSummary] = useState(false);
+  const [copySummarySuccess, setCopySummarySuccess] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRef = useRef<HTMLMediaElement | null>(null);
@@ -238,6 +255,10 @@ export default function ThaiSTTApp() {
     formData.append("vad_filter", String(vadFilter));
     formData.append("beam_size", fastMode ? "1" : "5");
     formData.append("chunk_duration", enableChunking ? String(chunkDuration) : "0");
+    formData.append("model_name", modelName);
+    if (initialPrompt.trim()) {
+      formData.append("initial_prompt", initialPrompt.trim());
+    }
 
     try {
       const response = await fetch(`${BACKEND_URL}/api/jobs`, {
@@ -279,6 +300,48 @@ export default function ThaiSTTApp() {
     localStorage.removeItem(STORAGE_KEY);
     setJobStatus("failed");
     setError("ยกเลิกการถอดเสียงเรียบร้อยแล้ว");
+  };
+
+  const handleFetchSummary = async () => {
+    if (!activeJobId) return;
+    setLoadingSummary(true);
+    setShowSummaryModal(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/jobs/${activeJobId}/summarize`, { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        setSummaryData(data);
+      }
+    } catch (err) {
+      console.warn("Failed to generate summary:", err);
+    } finally {
+      setLoadingSummary(false);
+    }
+  };
+
+  const handleCopySummary = async () => {
+    if (!summaryData) return;
+    const summaryText = `📌 สรุปการประชุม: ${summaryData.filename} (${summaryData.duration_minutes} นาที)
+
+ภาพรวม:
+${summaryData.overview}
+
+🏷️ คำสำคัญ:
+${summaryData.key_phrases?.join(", ") || "-"}
+
+💡 ประเด็นสำคัญ:
+${summaryData.key_points?.map((p: string, i: number) => `${i + 1}. ${p}`).join("\n") || "-"}
+
+✅ สิ่งที่ต้องดำเนินการต่อ (Action Items):
+${summaryData.action_items?.map((a: string) => `[ ] ${a}`).join("\n") || "-"}
+`;
+    try {
+      await navigator.clipboard.writeText(summaryText);
+      setCopySummarySuccess(true);
+      setTimeout(() => setCopySummarySuccess(false), 2000);
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   const handleReset = () => {
@@ -587,6 +650,39 @@ export default function ThaiSTTApp() {
 
               {/* Speed & Tuning Options */}
               <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-zinc-800/40 border border-slate-200 dark:border-zinc-800 space-y-3">
+                {/* Model Size Selection */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-slate-200/60 dark:border-zinc-700/60">
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-lg">🤖</span>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-zinc-200">
+                          ขนาดโมเดล AI (Model Size)
+                        </label>
+                        <span className="text-[10px] bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 font-bold px-1.5 py-0.5 rounded">
+                          {modelName === "small" ? "เร็วขึ้น 3 เท่า" : modelName === "large-v3-turbo" ? "ละเอียดสูงสุด" : "สมดุล"}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-500 dark:text-zinc-400">
+                        {modelName === "small"
+                          ? "small (244M): เร็วพิเศษ 3-4x บน CPU เหมาะอย่างยิ่งสำหรับไฟล์ยาว 1-3 ชม. (ใช้เวลาเพียง ~25-35 นาที)"
+                          : modelName === "large-v3-turbo"
+                          ? "large-v3-turbo (809M): โมเดลใหญ่ ละเอียดและแม่นยำสูงสุด (ใช้เวลาประมาณ 1.5-2 ชม. สำหรับไฟล์ 3 ชม.)"
+                          : "medium (769M): ขนาดกลาง สมดุลระหว่างความเร็วและความแม่นยำ"}
+                      </p>
+                    </div>
+                  </div>
+                  <select
+                    value={modelName}
+                    onChange={(e) => setModelName(e.target.value as "small" | "large-v3-turbo" | "medium")}
+                    className="text-xs font-semibold rounded-lg border border-slate-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-1.5 text-slate-700 dark:text-zinc-200 focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+                  >
+                    <option value="small">⚡ เร็วพิเศษ 3x (small - แนะนำไฟล์ยาว)</option>
+                    <option value="large-v3-turbo">🎯 ละเอียดสูงสุด (large-v3-turbo)</option>
+                    <option value="medium">⚖️ สมดุล (medium)</option>
+                  </select>
+                </div>
+
                 {/* Fast Mode Toggle */}
                 <div className="flex items-center justify-between pb-2.5 border-b border-slate-200/60 dark:border-zinc-700/60">
                   <div className="flex items-center gap-2.5">
@@ -669,7 +765,7 @@ export default function ThaiSTTApp() {
                       </label>
                       <p className="text-[11px] text-slate-500 dark:text-zinc-400">
                         {vadFilter
-                          ? "กำลังเปิดใช้งาน (เหมาะกับเสียงพูด ไม่เหมาะกับเพลง)"
+                          ? "กำลังเปิดใช้งาน (เหมาะกับเสียงพูด ช่วยตัดช่วงเงียบและช่วงเบรกประหยัดเวลา)"
                           : "ปิดอยู่ (แนะนำสำหรับเพลง เพื่อป้องกันเสียงร้องโดนตัดทิ้ง)"}
                       </p>
                     </div>
@@ -679,6 +775,23 @@ export default function ThaiSTTApp() {
                     checked={vadFilter}
                     onChange={(e) => setVadFilter(e.target.checked)}
                     className="w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500 accent-emerald-600 cursor-pointer"
+                  />
+                </div>
+
+                {/* Vocabulary Hint / Initial Prompt */}
+                <div className="space-y-1.5 pt-2.5 border-t border-slate-200/60 dark:border-zinc-700/60">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs sm:text-sm font-semibold text-slate-700 dark:text-zinc-200 flex items-center gap-2">
+                      <span>🏷️</span> คำศัพท์เฉพาะ / คีย์เวิร์ดช่วยจำ (Vocabulary Hint)
+                    </label>
+                    <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">ช่วยลดคำเพี้ยน 100%</span>
+                  </div>
+                  <input
+                    type="text"
+                    value={initialPrompt}
+                    onChange={(e) => setInitialPrompt(e.target.value)}
+                    placeholder="เช่น: คลาวด์, Cloud First Policy, สารสนเทศ, ภาครัฐ, Cyber Security, ชื่อวิทยากร"
+                    className="w-full text-xs rounded-xl border border-slate-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3.5 py-2 text-slate-800 dark:text-zinc-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
                   />
                 </div>
               </div>
@@ -744,6 +857,15 @@ export default function ThaiSTTApp() {
 
               {/* Action Buttons & Export Dropdown */}
               <div className="flex items-center gap-2">
+                <button
+                  onClick={handleFetchSummary}
+                  disabled={!transcript}
+                  className="px-3.5 py-1.5 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50 dark:bg-purple-950/40 hover:bg-purple-100 dark:hover:bg-purple-900/60 text-xs font-semibold text-purple-700 dark:text-purple-300 flex items-center gap-1.5 transition-colors cursor-pointer"
+                  title="สร้างสรุปเนื้อหาและประเด็นสำคัญจากการประชุม"
+                >
+                  <span>📝 สรุปการประชุม (AI Summary)</span>
+                </button>
+
                 <button
                   onClick={handleCopyToClipboard}
                   disabled={!transcript}
@@ -996,6 +1118,120 @@ export default function ThaiSTTApp() {
               <div className="pt-2 border-t border-slate-200 dark:border-zinc-800 flex justify-end">
                 <button
                   onClick={() => setShowHistoryModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-zinc-800 text-xs font-semibold text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 cursor-pointer"
+                >
+                  ปิดหน้าต่าง
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* AI Meeting Summary Modal */}
+        {showSummaryModal && (
+          <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl max-w-2xl w-full border border-slate-200 dark:border-zinc-800 shadow-2xl p-6 space-y-4 max-h-[85vh] flex flex-col animate-in fade-in">
+              <div className="flex items-center justify-between border-b border-slate-200 dark:border-zinc-800 pb-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xl">📝</span>
+                  <h3 className="font-bold text-lg text-slate-800 dark:text-zinc-100">
+                    สรุปผลการประชุม (AI Meeting Summary)
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setShowSummaryModal(false)}
+                  className="text-slate-400 hover:text-slate-600 dark:hover:text-zinc-200 p-1 rounded-lg cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+                {loadingSummary ? (
+                  <div className="text-center py-12 space-y-2">
+                    <div className="inline-block animate-spin text-2xl">⏳</div>
+                    <div className="text-slate-500 text-sm font-medium">กำลังวิเคราะห์และสร้างสรุปเนื้อหาการประชุม...</div>
+                  </div>
+                ) : !summaryData ? (
+                  <div className="text-center py-10 text-slate-400 text-sm">ไม่พบข้อมูลสรุป</div>
+                ) : (
+                  <div className="space-y-4 text-sm">
+                    {/* Overview */}
+                    <div className="p-3.5 rounded-xl bg-purple-50/60 dark:bg-purple-950/20 border border-purple-200/60 dark:border-purple-800/60 space-y-1">
+                      <div className="font-bold text-purple-800 dark:text-purple-300 text-xs uppercase tracking-wide flex items-center gap-1.5">
+                        <span>📌</span> ภาพรวม (Overview)
+                      </div>
+                      <p className="text-slate-700 dark:text-zinc-200 leading-relaxed text-xs sm:text-sm">
+                        {summaryData.overview}
+                      </p>
+                    </div>
+
+                    {/* Key Phrases */}
+                    {summaryData.key_phrases && summaryData.key_phrases.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="font-semibold text-xs text-slate-600 dark:text-zinc-400">
+                          🏷️ คำสำคัญและหัวข้อหลัก:
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {summaryData.key_phrases.map((phrase, i) => (
+                            <span
+                              key={i}
+                              className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-300 text-xs font-mono"
+                            >
+                              #{phrase}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Key Points */}
+                    {summaryData.key_points && summaryData.key_points.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="font-semibold text-xs text-slate-700 dark:text-zinc-300 flex items-center gap-1">
+                          <span>💡</span> ประเด็นสำคัญที่อภิปราย:
+                        </div>
+                        <div className="space-y-1 rounded-xl bg-slate-50 dark:bg-zinc-800/40 p-3 border border-slate-200 dark:border-zinc-800">
+                          {summaryData.key_points.map((pt, i) => (
+                            <div key={i} className="text-xs text-slate-700 dark:text-zinc-300 flex items-start gap-2 leading-relaxed">
+                              <span className="text-emerald-500 font-bold">•</span>
+                              <span>{pt}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Action Items */}
+                    {summaryData.action_items && summaryData.action_items.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="font-semibold text-xs text-emerald-700 dark:text-emerald-400 flex items-center gap-1">
+                          <span>✅</span> สิ่งที่ต้องดำเนินการต่อ / ข้อสั่งการ (Action Items):
+                        </div>
+                        <div className="space-y-1.5 rounded-xl bg-emerald-50/40 dark:bg-emerald-950/20 p-3 border border-emerald-200/60 dark:border-emerald-800/40">
+                          {summaryData.action_items.map((act, i) => (
+                            <div key={i} className="text-xs text-emerald-900 dark:text-emerald-200 flex items-start gap-2 leading-relaxed">
+                              <span className="text-emerald-600 font-bold shrink-0 mt-0.5">☑</span>
+                              <span>{act}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-2 border-t border-slate-200 dark:border-zinc-800 flex items-center justify-between">
+                <button
+                  onClick={handleCopySummary}
+                  disabled={!summaryData}
+                  className="px-3.5 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+                >
+                  {copySummarySuccess ? "✓ คัดลอกสรุปแล้ว!" : "📋 คัดลอกสรุป"}
+                </button>
+                <button
+                  onClick={() => setShowSummaryModal(false)}
                   className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-zinc-800 text-xs font-semibold text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 cursor-pointer"
                 >
                   ปิดหน้าต่าง

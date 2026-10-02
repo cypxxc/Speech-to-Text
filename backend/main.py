@@ -26,6 +26,8 @@ from faster_whisper.audio import decode_audio
 import db
 import worker
 import exporter
+import corrector
+import summarizer
 
 # Initialize SQLite database schema and storage directories
 db.init_db()
@@ -72,21 +74,21 @@ compute_type = "float16" if is_cuda else "int8"
 # Determine CPU threads (i5-11500B has 6 physical cores / 12 logical threads)
 cpu_threads = max(4, min(os.cpu_count() or 6, 8))
 
-model: Optional[WhisperModel] = None
+_model_cache: dict[str, WhisperModel] = {}
 
-def get_model():
-    global model
-    if model is None:
-        print(f"Initializing WhisperModel ('large-v3-turbo') on device='{device}' with compute_type='{compute_type}', cpu_threads={cpu_threads}...")
-        model = WhisperModel(
-            "large-v3-turbo",
+def get_model(model_name: str = "large-v3-turbo") -> WhisperModel:
+    global _model_cache
+    if model_name not in _model_cache:
+        print(f"Initializing WhisperModel ('{model_name}') on device='{device}' with compute_type='{compute_type}', cpu_threads={cpu_threads}...")
+        _model_cache[model_name] = WhisperModel(
+            model_name,
             device=device,
             compute_type=compute_type,
             cpu_threads=cpu_threads,
             num_workers=2,
         )
-        print("WhisperModel initialized successfully.")
-    return model
+        print(f"WhisperModel '{model_name}' initialized successfully.")
+    return _model_cache[model_name]
 
 @app.on_event("startup")
 async def startup_event():
@@ -126,6 +128,8 @@ async def create_job(
     vad_filter: bool = Form(True),
     beam_size: int = Form(1),
     chunk_duration: int = Form(0),
+    model_name: str = Form("large-v3-turbo"),
+    initial_prompt: Optional[str] = Form(None),
 ):
     filename = file.filename or "audio"
     _, ext = os.path.splitext(filename.lower())
@@ -166,6 +170,8 @@ async def create_job(
         vad_filter=vad_filter,
         beam_size=beam_size,
         chunk_duration=chunk_duration,
+        model_name=model_name,
+        initial_prompt=initial_prompt,
     )
 
     worker.start_transcription_job(
@@ -175,6 +181,8 @@ async def create_job(
         vad_filter=vad_filter,
         beam_size=beam_size,
         chunk_duration=chunk_duration,
+        model_name=model_name,
+        initial_prompt=initial_prompt,
     )
 
     return {"job_id": job_id, "status": "queued"}
@@ -237,9 +245,11 @@ def get_job_detail(job_id: str):
             full_text = " ".join([s["text"] for s in segments if s.get("text")])
             result = {"text": full_text, "segments": segments}
 
+    summary = db.get_summary(job_id)
     return {
         "job": job,
         "result": result,
+        "summary": summary,
     }
 
 
@@ -262,6 +272,43 @@ def cancel_job(job_id: str):
         db.save_final_result(job_id, full_text, segments)
 
     return {"job_id": job_id, "status": "failed", "message": "Job cancelled successfully"}
+
+
+@app.post("/api/jobs/{job_id}/summarize")
+def summarize_job(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = db.get_final_result(job_id)
+    if not result:
+        segments = db.get_segments(job_id)
+        if segments:
+            full_text = " ".join([s["text"] for s in segments if s.get("text")])
+            result = {"text": full_text, "segments": segments}
+        else:
+            raise HTTPException(status_code=400, detail="Job has no transcribed text to summarize")
+
+    text = result.get("text", "")
+    segments = result.get("segments", [])
+    duration = float(job.get("duration", 0.0))
+
+    summary = summarizer.generate_local_summary(
+        filename=job["filename"],
+        duration_sec=duration,
+        text=text,
+        segments=segments,
+    )
+    db.save_summary(job_id, summary)
+    return summary
+
+
+@app.get("/api/jobs/{job_id}/summary")
+def get_job_summary(job_id: str):
+    summary = db.get_summary(job_id)
+    if summary:
+        return summary
+    return summarize_job(job_id)
 
 
 @app.get("/api/jobs/{job_id}/audio")

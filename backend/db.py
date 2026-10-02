@@ -54,12 +54,21 @@ def init_db(db_path: Optional[str] = None, storage_dir: Optional[str] = None) ->
                 current_time REAL DEFAULT 0.0,
                 duration REAL DEFAULT 0.0,
                 error_message TEXT DEFAULT NULL,
+                model_name TEXT DEFAULT 'large-v3-turbo',
+                initial_prompt TEXT DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
+
+        # Automatically migrate existing SQLite database tables
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if "model_name" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN model_name TEXT DEFAULT 'large-v3-turbo'")
+        if "initial_prompt" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN initial_prompt TEXT DEFAULT NULL")
 
 
 def create_job(
@@ -70,6 +79,8 @@ def create_job(
     vad_filter: bool = True,
     beam_size: int = 1,
     chunk_duration: int = 0,
+    model_name: str = "large-v3-turbo",
+    initial_prompt: Optional[str] = None,
     db_path: Optional[str] = None,
     storage_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -83,9 +94,9 @@ def create_job(
             """
             INSERT OR REPLACE INTO jobs (
                 id, filename, filesize, audio_type, vad_filter, beam_size,
-                chunk_duration, status, progress, current_time, duration,
+                chunk_duration, model_name, initial_prompt, status, progress, current_time, duration,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0.0, 0.0, 0.0, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0.0, 0.0, 0.0, ?, ?)
             """,
             (
                 job_id,
@@ -95,6 +106,8 @@ def create_job(
                 1 if vad_filter else 0,
                 beam_size,
                 chunk_duration,
+                model_name,
+                initial_prompt,
                 now,
                 now,
             ),
@@ -261,4 +274,23 @@ def recover_interrupted_jobs(db_path: Optional[str] = None, storage_dir: Optiona
             save_final_result(jid, full_text, segments, storage_dir=actual_storage)
 
     return recovered_ids
+
+
+def save_summary(job_id: str, summary_data: Dict[str, Any], storage_dir: Optional[str] = None) -> None:
+    _, actual_storage = _resolve_paths(storage_dir=storage_dir)
+    job_dir = os.path.join(actual_storage, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    summary_path = os.path.join(job_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_data, f, ensure_ascii=False, indent=2)
+
+
+def get_summary(job_id: str, storage_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    _, actual_storage = _resolve_paths(storage_dir=storage_dir)
+    summary_path = os.path.join(actual_storage, job_id, "summary.json")
+    if not os.path.exists(summary_path):
+        return None
+    with open(summary_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 
