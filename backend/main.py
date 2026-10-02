@@ -4,16 +4,31 @@ import shutil
 import tempfile
 import uuid
 import logging
-import json
-import asyncio
-from typing import List, AsyncGenerator
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import StreamingResponse
+import datetime
+from typing import List, Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
+import av
+
+# Fix PyAV compatibility where 'metadata_errors' parameter was removed in av >= 14
+_orig_av_open = av.open
+def _compat_av_open(*args, **kwargs):
+    kwargs.pop("metadata_errors", None)
+    return _orig_av_open(*args, **kwargs)
+av.open = _compat_av_open
+
 from faster_whisper import WhisperModel
 from faster_whisper.audio import decode_audio
+
+import db
+import worker
+import exporter
+
+# Initialize SQLite database schema and storage directories
+db.init_db()
 
 # Ensure stdout and stderr handle Thai / UTF-8 characters without 'charmap' errors on Windows
 if sys.platform == "win32":
@@ -57,7 +72,7 @@ compute_type = "float16" if is_cuda else "int8"
 # Determine CPU threads (i5-11500B has 6 physical cores / 12 logical threads)
 cpu_threads = max(4, min(os.cpu_count() or 6, 8))
 
-model: WhisperModel = None
+model: Optional[WhisperModel] = None
 
 def get_model():
     global model
@@ -75,7 +90,8 @@ def get_model():
 
 @app.on_event("startup")
 async def startup_event():
-    # Model will be loaded or ready on startup
+    db.init_db()
+    # Model will be loaded or ready on startup in background thread
     import threading
     threading.Thread(target=get_model, daemon=True).start()
 
@@ -95,14 +111,16 @@ class TranscriptionResponse(BaseModel):
 def health_check():
     return {"status": "ok", "device": device, "compute_type": compute_type}
 
-def format_sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+# ==========================================
+# Resilient Asynchronous Job Suite
+# ==========================================
 
-@app.post("/api/transcribe_stream")
-async def transcribe_stream(
+@app.post("/api/jobs")
+async def create_job(
     file: UploadFile = File(...),
     audio_type: str = Form("general"),
     vad_filter: bool = Form(True),
+    beam_size: int = Form(1),
     chunk_duration: int = Form(0),
 ):
     filename = file.filename or "audio"
@@ -113,230 +131,186 @@ async def transcribe_stream(
             detail=f"Unsupported file extension '{ext}'. Supported formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
-    temp_dir = tempfile.mkdtemp()
-    safe_name = f"audio_{uuid.uuid4().hex[:12]}{ext}"
-    temp_file_path = os.path.join(temp_dir, safe_name)
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    job_dir = os.path.join(db.DEFAULT_STORAGE_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    audio_path = os.path.join(job_dir, f"audio{ext}")
 
-    # Save uploaded file
     written_size = 0
     chunk_size = 1024 * 1024  # 1MB chunks
-    with open(temp_file_path, "wb") as buffer:
+    with open(audio_path, "wb") as buffer:
         while True:
             chunk = await file.read(chunk_size)
             if not chunk:
                 break
             written_size += len(chunk)
             if written_size > MAX_FILE_SIZE:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
                 limit_gb = MAX_FILE_SIZE / (1024 * 1024 * 1024)
-                if os.path.exists(temp_file_path):
-                    os.remove(temp_file_path)
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 raise HTTPException(
                     status_code=413,
                     detail=f"ไฟล์มีขนาดใหญ่เกินกำหนด (จำกัดไม่เกิน {limit_gb:.0f} GB)"
                 )
             buffer.write(chunk)
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            yield format_sse("progress", {
-                "stage": "loading_model",
-                "progress": 5,
-                "message": "กำลังเตรียมและโหลดโมเดล AI (Faster-Whisper)..."
-            })
-            await asyncio.sleep(0.01)
-
-            loop = asyncio.get_event_loop()
-            whisper_instance = await loop.run_in_executor(None, get_model)
-
-            is_music = audio_type.lower() == "music"
-            use_vad = False if is_music else vad_filter
-            vad_params = dict(min_silence_duration_ms=500, speech_pad_ms=400) if use_vad else None
-            no_speech_thresh = None if is_music else 0.6
-            comp_ratio = 2.8 if is_music else 2.4
-            prompt = "เนื้อเพลงภาษาไทย คำร้องทำนอง บทเพลง" if is_music else None
-
-            segment_list = []
-            collected_text = []
-
-            if chunk_duration > 0:
-                yield format_sse("progress", {
-                    "stage": "decoding_audio",
-                    "progress": 10,
-                    "message": "กำลังอ่านและถอดรหัสไฟล์เสียง (Audio Decoding)..."
-                })
-                await asyncio.sleep(0.01)
-
-                waveform = await loop.run_in_executor(
-                    None, lambda: decode_audio(temp_file_path, sampling_rate=16000)
-                )
-                total_samples = len(waveform)
-                total_duration = total_samples / 16000.0
-                num_chunks = int(np.ceil(total_duration / chunk_duration)) if total_duration > chunk_duration else 1
-
-                yield format_sse("progress", {
-                    "stage": "processing",
-                    "progress": 15,
-                    "total_chunks": num_chunks,
-                    "current_chunk": 0,
-                    "total_duration": round(total_duration, 2),
-                    "message": f"เตรียมถอดเสียง {num_chunks} ช่วง (ความยาวรวม {total_duration/60:.1f} นาที)..."
-                })
-                await asyncio.sleep(0.01)
-
-                if total_duration > chunk_duration:
-                    for idx in range(num_chunks):
-                        start_sec = idx * chunk_duration
-                        end_sec = min((idx + 1) * chunk_duration, total_duration)
-                        start_sample = int(start_sec * 16000)
-                        end_sample = min(int(end_sec * 16000), total_samples)
-
-                        if (end_sample - start_sample) < 16000 * 0.3:
-                            continue
-
-                        chunk_audio = waveform[start_sample:end_sample]
-                        # Progress ranges from 15% to 95%
-                        current_pct = int(15 + ((idx + 1) / num_chunks) * 80)
-                        yield format_sse("progress", {
-                            "stage": "processing",
-                            "progress": current_pct,
-                            "current_chunk": idx + 1,
-                            "total_chunks": num_chunks,
-                            "start_sec": round(start_sec, 1),
-                            "end_sec": round(end_sec, 1),
-                            "message": f"กำลังถอดเสียงท่อนที่ {idx + 1}/{num_chunks} ({start_sec:.0f}s - {end_sec:.0f}s)..."
-                        })
-                        await asyncio.sleep(0.01)
-
-                        def run_chunk(audio_data):
-                            chunks_gen, _ = whisper_instance.transcribe(
-                                audio_data,
-                                language="th",
-                                beam_size=5,
-                                best_of=5,
-                                vad_filter=use_vad,
-                                vad_parameters=vad_params,
-                                temperature=0.0,
-                                condition_on_previous_text=False,
-                                no_speech_threshold=no_speech_thresh,
-                                compression_ratio_threshold=comp_ratio,
-                                initial_prompt=prompt,
-                            )
-                            return list(chunks_gen)
-
-                        chunk_segs = await loop.run_in_executor(None, run_chunk, chunk_audio)
-
-                        for seg in chunk_segs:
-                            text_strip = seg.text.strip()
-                            abs_start = round(start_sec + seg.start, 2)
-                            abs_end = round(start_sec + seg.end, 2)
-                            segment_item = {
-                                "start": abs_start,
-                                "end": abs_end,
-                                "text": text_strip
-                            }
-                            segment_list.append(segment_item)
-                            if text_strip:
-                                collected_text.append(text_strip)
-
-                            # Stream newly found segment
-                            yield format_sse("segment", segment_item)
-                            await asyncio.sleep(0.005)
-                else:
-                    def run_single():
-                        gen, _ = whisper_instance.transcribe(
-                            waveform,
-                            language="th",
-                            beam_size=5,
-                            best_of=5,
-                            vad_filter=use_vad,
-                            vad_parameters=vad_params,
-                            temperature=0.0,
-                            condition_on_previous_text=False,
-                            no_speech_threshold=no_speech_thresh,
-                            compression_ratio_threshold=comp_ratio,
-                            initial_prompt=prompt,
-                        )
-                        return list(gen)
-
-                    segs = await loop.run_in_executor(None, run_single)
-                    for seg in segs:
-                        text_strip = seg.text.strip()
-                        segment_item = {
-                            "start": round(seg.start, 2),
-                            "end": round(seg.end, 2),
-                            "text": text_strip
-                        }
-                        segment_list.append(segment_item)
-                        if text_strip:
-                            collected_text.append(text_strip)
-                        yield format_sse("segment", segment_item)
-            else:
-                yield format_sse("progress", {
-                    "stage": "processing",
-                    "progress": 20,
-                    "message": "กำลังถอดเสียงทั้งไฟล์ต่อเนื่อง..."
-                })
-                await asyncio.sleep(0.01)
-
-                def run_full():
-                    gen, _ = whisper_instance.transcribe(
-                        temp_file_path,
-                        language="th",
-                        beam_size=5,
-                        best_of=5,
-                        vad_filter=use_vad,
-                        vad_parameters=vad_params,
-                        temperature=0.0,
-                        condition_on_previous_text=False,
-                        no_speech_threshold=no_speech_thresh,
-                        compression_ratio_threshold=comp_ratio,
-                        initial_prompt=prompt,
-                    )
-                    # Note: Faster-Whisper generator yields segments as audio is decoded
-                    items = []
-                    for seg in gen:
-                        items.append({
-                            "start": round(seg.start, 2),
-                            "end": round(seg.end, 2),
-                            "text": seg.text.strip()
-                        })
-                    return items
-
-                items = await loop.run_in_executor(None, run_full)
-                for seg in items:
-                    segment_list.append(seg)
-                    if seg["text"]:
-                        collected_text.append(seg["text"])
-                    yield format_sse("segment", seg)
-
-            full_text = " ".join(collected_text)
-            yield format_sse("complete", {
-                "text": full_text,
-                "segments": segment_list
-            })
-
-        except Exception as err:
-            logging.exception("Error in transcribe_stream")
-            yield format_sse("error", {"detail": str(err)})
-        finally:
-            try:
-                if os.path.exists(temp_file_path):
-                    os.remove(temp_file_path)
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception as cleanup_err:
-                print(f"Warning during cleanup: {cleanup_err}")
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
+    created = db.create_job(
+        job_id=job_id,
+        filename=filename,
+        filesize=written_size,
+        audio_type=audio_type,
+        vad_filter=vad_filter,
+        beam_size=beam_size,
+        chunk_duration=chunk_duration,
     )
+
+    worker.start_transcription_job(
+        job_id=job_id,
+        audio_file_path=audio_path,
+        audio_type=audio_type,
+        vad_filter=vad_filter,
+        beam_size=beam_size,
+        chunk_duration=chunk_duration,
+    )
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/jobs")
+def list_jobs(limit: int = 50):
+    return db.list_jobs(limit=limit)
+
+
+@app.get("/api/jobs/{job_id}/progress")
+def get_job_progress(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    segments = db.get_segments(job_id)
+    
+    elapsed = 0.0
+    created_at_str = job.get("created_at")
+    if created_at_str:
+        try:
+            dt = datetime.datetime.fromisoformat(created_at_str)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            elapsed = max(0.0, (now - dt).total_seconds())
+        except Exception:
+            pass
+
+    progress = float(job.get("progress", 0.0))
+    eta = 0.0
+    if 0.0 < progress < 100.0 and elapsed > 0.0:
+        eta = max(0.0, (elapsed / progress) * (100.0 - progress))
+
+    return {
+        "job_id": job["id"],
+        "status": job["status"],
+        "progress": progress,
+        "current_time": float(job.get("current_time", 0.0)),
+        "duration": float(job.get("duration", 0.0)),
+        "elapsed_seconds": round(elapsed, 1),
+        "estimated_remaining_seconds": round(eta, 1),
+        "latest_segments": segments[-10:] if len(segments) > 10 else segments,
+        "segment_count": len(segments),
+        "error_message": job.get("error_message"),
+    }
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job_detail(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = db.get_final_result(job_id)
+    if not result:
+        segments = db.get_segments(job_id)
+        if segments:
+            full_text = " ".join([s["text"] for s in segments if s.get("text")])
+            result = {"text": full_text, "segments": segments}
+
+    return {
+        "job": job,
+        "result": result,
+    }
+
+
+@app.get("/api/jobs/{job_id}/audio")
+def get_job_audio(job_id: str):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job_dir = os.path.join(db.DEFAULT_STORAGE_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job storage not found")
+
+    # Locate audio file
+    for f in os.listdir(job_dir):
+        if f.startswith("audio."):
+            audio_path = os.path.join(job_dir, f)
+            return FileResponse(path=audio_path, filename=job["filename"])
+
+    raise HTTPException(status_code=404, detail="Audio file not found for this job")
+
+
+@app.get("/api/jobs/{job_id}/export")
+def export_job_result(
+    job_id: str,
+    format: str = Query("txt", pattern="^(txt|srt|vtt|json)$"),
+    timestamps: bool = Query(False),
+):
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = db.get_final_result(job_id)
+    if not result:
+        segments = db.get_segments(job_id)
+        if segments:
+            full_text = " ".join([s["text"] for s in segments if s.get("text")])
+            result = {"text": full_text, "segments": segments}
+        else:
+            raise HTTPException(status_code=400, detail="Job has no transcription results yet")
+
+    text = result.get("text", "")
+    segments = result.get("segments", [])
+
+    base_name, _ = os.path.splitext(job["filename"])
+    safe_base = "".join(c for c in base_name if c.isalnum() or c in ("-", "_", " ")).strip() or job_id
+
+    if format == "srt":
+        content = exporter.export_srt(segments)
+        media_type = "text/plain; charset=utf-8"
+        filename = f"{safe_base}.srt"
+    elif format == "vtt":
+        content = exporter.export_vtt(segments)
+        media_type = "text/vtt; charset=utf-8"
+        filename = f"{safe_base}.vtt"
+    elif format == "json":
+        content = exporter.export_json(job, text, segments)
+        media_type = "application/json; charset=utf-8"
+        filename = f"{safe_base}.json"
+    else:  # txt
+        content = exporter.export_txt(text, segments, include_timestamps=timestamps)
+        media_type = "text/plain; charset=utf-8"
+        suffix = "_timestamped" if timestamps else ""
+        filename = f"{safe_base}{suffix}.txt"
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ==========================================
+# Legacy Synchronous Transcription Endpoint
+# ==========================================
 
 @app.post("/api/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(
@@ -353,14 +327,13 @@ async def transcribe_audio(
             detail=f"Unsupported file extension '{ext}'. Supported formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
-    # Save to a temporary file with safe ASCII name to prevent C-library encoding issues
     temp_dir = tempfile.mkdtemp()
     safe_name = f"audio_{uuid.uuid4().hex[:12]}{ext}"
     temp_file_path = os.path.join(temp_dir, safe_name)
 
     try:
         written_size = 0
-        chunk_size = 1024 * 1024  # 1MB chunks
+        chunk_size = 1024 * 1024
         with open(temp_file_path, "wb") as buffer:
             while True:
                 chunk = await file.read(chunk_size)
@@ -394,18 +367,13 @@ async def transcribe_audio(
         segment_list = []
         collected_text = []
 
-        print(f"Transcribing '{filename}' (audio_type={audio_type}, use_vad={use_vad}, chunk_duration={chunk_duration}s)...")
-
         if chunk_duration > 0:
             waveform = decode_audio(temp_file_path, sampling_rate=16000)
             total_samples = len(waveform)
             total_duration = total_samples / 16000.0
-            print(f"Loaded audio: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
 
             if total_duration > chunk_duration:
                 num_chunks = int(np.ceil(total_duration / chunk_duration))
-                print(f"Splitting into {num_chunks} chunks of {chunk_duration}s...")
-
                 for idx in range(num_chunks):
                     start_sec = idx * chunk_duration
                     end_sec = min((idx + 1) * chunk_duration, total_duration)
@@ -416,8 +384,6 @@ async def transcribe_audio(
                         continue
 
                     chunk_audio = waveform[start_sample:end_sample]
-                    print(f"  -> Processing Chunk {idx + 1}/{num_chunks} [{start_sec:.1f}s - {end_sec:.1f}s]...")
-
                     chunk_segments, _ = whisper_instance.transcribe(
                         chunk_audio,
                         language="th",
@@ -492,7 +458,6 @@ async def transcribe_audio(
                     collected_text.append(text_strip)
 
         full_text = " ".join(collected_text)
-
         return {
             "text": full_text,
             "segments": segment_list
@@ -508,4 +473,3 @@ async def transcribe_audio(
                 shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as cleanup_err:
             print(f"Warning during cleanup: {cleanup_err}")
-
